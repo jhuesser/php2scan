@@ -24,9 +24,9 @@ Standard library only. Runs behind nginx (see deploy/), e.g.:
 import argparse
 import bisect
 import collections
-import concurrent.futures as cf
 import ipaddress
 import json
+import multiprocessing as mp
 import os
 import re
 import socket
@@ -355,10 +355,15 @@ def normalize_host(raw):
     return s
 
 
+NAT64 = ipaddress.ip_network("64:ff9b::/96")   # DNS64/NAT64 well-known prefix -> embedded IPv4
+
+
 def is_public(ip):
     a = ipaddress.ip_address(ip)
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
+    elif a.version == 6 and a in NAT64:         # 64:ff9b::a00:1 reaches 10.0.0.1 via the NAT64 gateway
+        a = ipaddress.IPv4Address(int(a) & 0xFFFFFFFF)
     return a.is_global and not (a.is_multicast or a.is_reserved or a.is_loopback
                                 or a.is_link_local or a.is_private)
 
@@ -451,6 +456,10 @@ def php_assessment(version):
         return {"status": "unknown",
                 "text": "The PHP version is not exposed, so the patch status cannot be checked "
                         "from outside. Check it on the server (package changelog or php -v)."}
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        return {"status": "unknown",
+                "text": f"The site only reveals PHP {version}, without the patch level, so the "
+                        "patch status cannot be checked from outside. Check it on the server (php -v)."}
     if version in DISTRO_VERSIONS:
         return {"status": "unknown",
                 "text": f"PHP {version} is a Linux distribution build. Distributions backport "
@@ -459,6 +468,10 @@ def php_assessment(version):
                         "check the package changelog on the server."}
     branch = ".".join(version.split(".")[:2])
     fixed = PHP_FIXED.get(branch)
+    if not fixed and version_ge(branch, max(PHP_FIXED, key=lambda b: [int(x) for x in b.split(".")])):
+        return {"status": "good",
+                "text": f"PHP {version} is newer than all releases affected by PHP2Shell "
+                        "(CVE-2026-109618/-109619)."}
     if not fixed:
         return {"status": "bad",
                 "text": f"PHP {branch} is end-of-life upstream and gets no official security "
@@ -508,6 +521,41 @@ def scan(host, ip):
     return result
 
 
+def _scan_child(host, ip, conn):
+    """Runs scan() in its own process: a hostile page can't hang or starve the web
+    server (regex backtracking holds the GIL, a trickling server holds a thread)."""
+    try:
+        cmsscan.load_rules()
+        conn.send((True, scan(host, ip)))
+    except Exception as e:  # noqa: BLE001
+        conn.send((False, repr(e)))
+    finally:
+        conn.close()
+
+
+def run_scan(host, ip, timeout):
+    """scan() in a child process that is killed after timeout seconds. None = timed out."""
+    ctx = mp.get_context("spawn")                           # no inherited locks/threads
+    recv, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_scan_child, args=(host, ip, send), daemon=True)
+    proc.start()
+    send.close()
+    try:
+        if not recv.poll(timeout):
+            return None
+        ok, value = recv.recv()
+    except EOFError:
+        raise RuntimeError("scan process exited unexpectedly") from None
+    finally:
+        recv.close()
+        if proc.is_alive():
+            proc.kill()
+        proc.join(5)
+    if not ok:
+        raise RuntimeError(value)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # web server
 # ---------------------------------------------------------------------------
@@ -525,7 +573,6 @@ class App:
         self.limiter = Limiter()
         self.sem = threading.BoundedSemaphore(MAX_CONCURRENT)
         self.cache, self.cache_lock = {}, threading.Lock()
-        self.pool = cf.ThreadPoolExecutor(max_workers=MAX_CONCURRENT + 2)
         self.audit_lock = threading.Lock()
         self.deny_ips = set(a.deny_ip)
         self.trusted = [ipaddress.ip_network(t, strict=False) for t in a.trusted_proxy]
@@ -649,15 +696,13 @@ class App:
             return 503, {"error": "The service is busy right now. Please try again in a minute."}, \
                 {"Retry-After": "60"}
         try:
-            fut = self.pool.submit(scan, host, ip)
-            try:
-                result = fut.result(timeout=SCAN_TIMEOUT)
-            except cf.TimeoutError:
-                result = {"host": host, "ip": ip, "reachable": False,
-                          "error": "The website took too long to respond.", "php": False,
-                          "apps": [], "evidence": [], "recommendations": []}
+            result = run_scan(host, ip, SCAN_TIMEOUT)       # semaphore held until the child is gone
         finally:
             self.sem.release()
+        if result is None:
+            result = {"host": host, "ip": ip, "reachable": False,
+                      "error": "The website took too long to respond.", "php": False,
+                      "apps": [], "evidence": [], "recommendations": []}
         checked_at = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         with self.cache_lock:
             self.cache[host] = (time.time(), result, checked_at)
@@ -694,6 +739,7 @@ def make_handler(app):
         server_version = "cmsweb"
         sys_version = ""
         protocol_version = "HTTP/1.1"
+        timeout = 30                                        # idle/slow clients don't keep a thread forever
 
         def log_message(self, fmt, *args):
             if app.a.access_log:
@@ -712,6 +758,8 @@ def make_handler(app):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache)
+            if self.close_connection:
+                self.send_header("Connection", "close")
             for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
                 self.send_header(k, v)
             self.end_headers()
@@ -733,6 +781,8 @@ def make_handler(app):
         do_HEAD = do_GET
 
         def do_POST(self):
+            # rejected requests leave their body unread; never parse it as the next request
+            self.close_connection = True
             if self.path.split("?", 1)[0] != "/api/scan":
                 return self.send_json(404, {"error": "Not found."})
             if app.a.origin and self.headers.get("Origin", "") != app.a.origin:

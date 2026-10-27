@@ -26,9 +26,15 @@ loads the site's start page like a browser would and reports:
 docker run -d --name php2scan --restart unless-stopped \
   -p 127.0.0.1:8088:8088 \
   -e CMSWEB_ORIGIN=https://scan.example.ch \
+  -e CMSWEB_TRUSTED_PROXY=172.17.0.1 \
   -v php2scan-data:/data \
   ghcr.io/akaihigurashi/php2scan:latest
 ```
+
+`CMSWEB_TRUSTED_PROXY` must be the address the container sees your reverse proxy
+connect from (the default bridge gateway, check with
+`docker network inspect bridge`). Without it every visitor appears as that gateway
+and all of them share one rate limit.
 
 Or with Compose: download [`docker-compose.yml`](docker-compose.yml), set
 `CMSWEB_ORIGIN` to your public address, then:
