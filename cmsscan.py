@@ -56,7 +56,6 @@ Verdict column:
 import argparse
 import concurrent.futures as cf
 import csv
-import fnmatch
 import functools
 import glob
 import hashlib
@@ -650,12 +649,13 @@ def _load_techs(techs):
             return                       # JS-only regex syntax: skip
         DB_RULES.append((tech, kind, key, rx, ver))
 
+    DB_RULES.clear()                     # loading twice must not duplicate every rule
     for t in php:
         d = techs.get(t, {})
         for k, v in (d.get("headers") or {}).items():
             add(t, "header", k.lower(), v)
         for k, v in (d.get("cookies") or {}).items():
-            add(t, "cookie", k, v)
+            add(t, "cookie", k.lower(), v)   # literal name, e.g. "mybb[lastactive]"
         for k, v in (d.get("meta") or {}).items():
             for p in as_list(v):
                 add(t, "meta", k.lower(), p)
@@ -677,7 +677,7 @@ def parse_response(final, hdr, cookie, body):
     cookies = {}
     for line in cookie.splitlines():
         name, _, val = line.split(";", 1)[0].partition("=")
-        cookies[name.strip()] = val.strip()
+        cookies[name.strip().lower()] = val.strip()
     metas = {}
     for tag in re.findall(r"<meta\s[^>]*>", body, re.I):
         name = re.search(r"""(?:name|property|http-equiv)\s*=\s*["']([^"']+)""", tag, re.I)
@@ -697,7 +697,7 @@ def match_db(final, hdr, cookie, body):
         if kind == "header":
             values = headers.get(key, [])
         elif kind == "cookie":
-            values = [v for n, v in cookies.items() if fnmatch.fnmatch(n, key)]
+            values = [cookies[key]] if key in cookies else []
         elif kind == "meta":
             values = metas.get(key, [])
         elif kind == "html":
@@ -710,12 +710,24 @@ def match_db(final, hdr, cookie, body):
             m = rx.search(v) if rx else True
             if not m:
                 continue
-            version = ""
-            if rx and ver and "\\1" in ver and m.lastindex:
-                version = m.group(1) or ""
+            version = resolve_version(ver, m) if rx and ver else ""
             text = (m.group(0) if rx else f"{key} present")[:90]
             yield tech, f"db-{kind}", text, version
             break
+
+
+def resolve_version(template, m):
+    """Wappalyzer version template: \\1 = group 1, \\1?a:b = a if group 1 matched, else b."""
+    def group(i):
+        try:
+            return m.group(i) or ""
+        except IndexError:
+            return ""
+    v = re.sub(r"\\(\d)\?([^:]*):(.*)$", lambda t: t.group(2) if group(int(t.group(1))) else t.group(3),
+               template)
+    return re.sub(r"\\(\d)", lambda t: group(int(t.group(1))), v).strip()
+
+
 PHP_LINK = r"""(?:href|src|action)\s*=\s*["']([^"'#?]*\.php)(?:[?#"'])"""
 
 
@@ -780,6 +792,7 @@ RESULT_META = {}   # target -> (body hash, <title>) to spot vhosts that just sho
 # absolute or protocol-relative URL: https://host, http://host, //host  (also JSON-escaped)
 URL_HOST_RX = re.compile(r"(?:https?:)?//([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?|\[[0-9a-f:.]+\])(?::\d+)?"
                          r"(?:[/?#][^\s\"'<>()\\,]*)?", re.I)   # host + the whole rest of the URL
+MAX_LOCAL_LOOKUPS = 50   # per page: further unknown hosts count as external without DNS
 
 
 def local_view(body, host, server_ips):
@@ -796,7 +809,8 @@ def local_view(body, host, server_ips):
         if h in me or h in server_ips:
             return True
         if h not in verdict:
-            if is_ip(h) or "." not in h:
+            # a page can list thousands of hostnames: only the first few cost a DNS lookup
+            if is_ip(h) or "." not in h or len(verdict) >= MAX_LOCAL_LOOKUPS:
                 verdict[h] = False
             else:
                 verdict[h] = bool(server_ips and set(resolve(h)) & server_ips)
@@ -1111,7 +1125,6 @@ def _check(target, timeout, log):
 
 def expand(arg):
     """An IP, IP range (CIDR), hostname, URL, or a file containing any of these."""
-    import ipaddress, os
     if os.path.isfile(arg):
         out = []
         with open(arg, encoding="utf-8") as f:
@@ -1123,11 +1136,18 @@ def expand(arg):
     if "/" in arg and "://" not in arg:
         try:
             net = ipaddress.ip_network(arg, strict=False)
+        except ValueError:
+            net = None
+        if net is not None:
+            if net.num_addresses > MAX_RANGE:        # an IPv6 /64 would never finish expanding
+                sys.exit(f"error: {arg} has {net.num_addresses} addresses; split it into "
+                         f"ranges of at most {MAX_RANGE} (e.g. /16 for IPv4)")
             hosts = list(net.hosts()) or [net.network_address]
             return [f"[{h}]" if h.version == 6 else str(h) for h in hosts]
-        except ValueError:
-            pass
     return [arg]
+
+
+MAX_RANGE = 65536
 
 
 # Common web ports: standard, alternate HTTP/HTTPS, and hosting panels
@@ -1332,8 +1352,8 @@ def pdns_otx(ip, timeout):
 def pdns_hackertarget(ip, timeout):
     """HackerTarget reverse IP (free, no key, few queries per day)."""
     txt = _get(f"https://api.hackertarget.com/reverseiplookup/?q={ip}", timeout)
-    low = txt.lower()
-    if "error" in low or "api count" in low or "no dns a records" in low or "no records" in low:
+    first = txt.strip().split("\n", 1)[0].lower()            # errors are a single text line;
+    if first.startswith(("error", "api count", "no dns a records", "no records")):   # names may contain "error"
         raise RuntimeError(txt.strip()[:80])
     return set(txt.split())
 
@@ -1535,6 +1555,20 @@ def discover_vhosts(ip, web_ports, a):
     return {n: keep[n] for n in names}, dns, log
 
 
+CTRL_RX = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(v):
+    """Text for the terminal: no escape sequences from a hostile Server header or URL."""
+    return CTRL_RX.sub("?", str(v))
+
+
+def csv_cell(v):
+    """CSV value that spreadsheets won't run as a formula (=HYPERLINK(...) in a header)."""
+    v = clean(v)
+    return "'" + v if v.startswith(("=", "+", "-", "@")) else v
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="cmsscan - PHP/CMS detection with integrated TCP port scan. "
@@ -1650,7 +1684,8 @@ def main():
             return
         if row[3] in ("ERROR", "NOT HTTP") and not a.all and (len(targets) > 1 or row[0] in scanned):
             return
-        print(f"{row[0]:<{W}} {row[3]:<16} {row[5][:24]:<24} {row[6][:28]:<28} {row[7]}", flush=True)
+        c = [clean(x) for x in row]          # Server header etc. come from the scanned site
+        print(f"{c[0]:<{W}} {c[3]:<16} {c[5][:24]:<24} {c[6][:28]:<28} {c[7]}", flush=True)
 
     # --- phase 1: quick TCP connect scan on web ports ---------------------
     checks = []          # "host:port" or URL items for the HTTP phase
@@ -1790,7 +1825,7 @@ def main():
         with open(a.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter=";")
             w.writerow(cols)
-            w.writerows(rows)
+            w.writerows([[csv_cell(x) for x in r] for r in rows])
 
     summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
     print(f"\n{len(targets)} target(s), {len(rows)} result(s) ({summary})" + (f" -> {a.out}" if a.out else ""))
